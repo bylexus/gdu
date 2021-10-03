@@ -3,74 +3,12 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math"
-	"os"
-	"path/filepath"
 	"runtime"
 	"sync"
 
 	gdu "alexi.ch/gdu/lib"
 )
-
-func examineDir(jobQueue chan gdu.Filelike, wg *sync.WaitGroup, dir *gdu.Dir) error {
-	files, err := ioutil.ReadDir(dir.RelPath)
-	if err != nil {
-		return err
-	}
-	for _, file := range files {
-		filelike, err := createFileLike(filepath.Join(dir.RelPath, file.Name()))
-		if err == nil && filelike != nil {
-			dir.Children = append(dir.Children, filelike)
-			// enqueue for later, parallel examination:
-			enqueueJob(jobQueue, wg, filelike)
-		}
-	}
-	return nil
-}
-
-func examineFile(file *gdu.File) {
-	file.SizeBytes = uint64(file.FileInfo.Size())
-}
-
-func createFileLike(path string) (gdu.Filelike, error) {
-	var ret gdu.Filelike
-
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-
-	if fileInfo.IsDir() {
-		dir := gdu.NewDir(path, fileInfo)
-		ret = &dir
-	} else if fileInfo.Mode().IsRegular() {
-		file := gdu.NewFile(path, fileInfo)
-		ret = &file
-	}
-
-	return ret, err
-}
-
-func examineFilelike(jobQueue chan gdu.Filelike, wg *sync.WaitGroup, file gdu.Filelike) {
-	switch file.(type) {
-	case *gdu.Dir:
-		examineDir(jobQueue, wg, file.(*gdu.Dir))
-	case *gdu.File:
-		examineFile(file.(*gdu.File))
-	}
-}
-
-func enqueueJob(jobQueue chan gdu.Filelike, wg *sync.WaitGroup, job gdu.Filelike) {
-	wg.Add(1)
-	select {
-	case jobQueue <- job: // ok, someone else took it
-	default:
-		// do it myself, no one else has time:
-		examineFilelike(jobQueue, wg, job)
-		wg.Done()
-	}
-}
 
 func printEntry(entry gdu.Filelike, flags gdu.Flags) {
 	if flags.PrintDetails == gdu.OUTPUT_FULL {
@@ -135,34 +73,32 @@ func main() {
 	flags.NrOfWorkers = workers
 
 	topLevelFiles := make([]gdu.Filelike, 0)
-	jobs := make(chan gdu.Filelike)
-	wg := new(sync.WaitGroup)
-
-	for i := 0; i < flags.NrOfWorkers; i++ {
-		go func() {
-			for job := range jobs {
-				// do job
-				examineFilelike(jobs, wg, job)
-				wg.Done()
-			}
-		}()
+	queue := gdu.JobQueue{
+		WaitGroup: new(sync.WaitGroup),
+		JobQueue:  make(chan gdu.Filelike),
 	}
 
+	// start workers:
+	for i := 0; i < flags.NrOfWorkers; i++ {
+		w := gdu.NewWorker(&queue)
+		go w.ProcessJobs()
+	}
+
+	// create top-level work items:
 	for _, path := range searchPaths {
-		filelike, err := createFileLike(path)
+		filelike, err := gdu.CreateFileLike(path)
 		if err == nil {
 			topLevelFiles = append(topLevelFiles, filelike)
-			enqueueJob(jobs, wg, filelike)
+			queue.EnqueueJob(filelike)
 		}
 	}
-	wg.Wait()
-	close(jobs)
+	// wait for all workers to signal they're done:
+	queue.Join()
 
 	var total uint64 = 0
 	for _, f := range topLevelFiles {
 		total += f.GetByteSize()
 		printEntry(f, flags)
-		// fmt.Printf("%v %v, nr of childs: \n", toHumanReadableSize(f.GetByteSize()), f.GetPath())
 	}
 	if len(topLevelFiles) > 1 {
 		printEntry(&gdu.File{SizeBytes: total, RelPath: "Total"}, flags)

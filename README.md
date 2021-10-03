@@ -54,6 +54,12 @@ This leads to deadlocks if not handled properly. So I came up with the following
 
 This makes processing also of big / deep directories very fast.
 
+## TODO
+
+* support `-a`: show only dirs by default, show all files with `-a`
+* support `-c`: show no grand total by default, show a total with `-c`
+* support `-L`: follow symlinks
+
 
 
 (c) 2021 Alex Schenkel
