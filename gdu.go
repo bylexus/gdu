@@ -3,48 +3,37 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/fs"
 	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 
 	gdu "alexi.ch/gdu/lib"
 )
 
-var flags gdu.Flags = gdu.Flags{HumanReadable: false, PrintDetails: true}
-
-func examineDir(path string) (gdu.Filelike, error) {
-	var files []fs.FileInfo
-	var err error
-
-	d := gdu.Dir{
-		RelPath:        path,
-		TotalSizeBytes: 0,
-		Children:       make([]gdu.Filelike, 0),
-	}
-	files, err = ioutil.ReadDir(path)
+func examineDir(jobQueue chan gdu.Filelike, wg *sync.WaitGroup, dir *gdu.Dir) error {
+	files, err := ioutil.ReadDir(dir.RelPath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for _, file := range files {
-		child, err := examinePath(filepath.Join(path, file.Name()))
-		if err == nil && child != nil {
-			d.TotalSizeBytes += child.GetByteSize()
-			d.Children = append(d.Children, child)
+		filelike, err := createFileLike(filepath.Join(dir.RelPath, file.Name()))
+		if err == nil && filelike != nil {
+			dir.Children = append(dir.Children, filelike)
+			// enqueue for later, parallel examination:
+			enqueueJob(jobQueue, wg, filelike)
 		}
 	}
-	return d, nil
+	return nil
 }
 
-func examineFile(fileInfo fs.FileInfo, path string) (gdu.Filelike, error) {
-	return gdu.File{
-		RelPath:   path,
-		SizeBytes: uint64(fileInfo.Size()),
-	}, nil
+func examineFile(file *gdu.File) {
+	file.SizeBytes = uint64(file.FileInfo.Size())
 }
 
-func examinePath(path string) (gdu.Filelike, error) {
+func createFileLike(path string) (gdu.Filelike, error) {
 	var ret gdu.Filelike
 
 	fileInfo, err := os.Stat(path)
@@ -53,18 +42,45 @@ func examinePath(path string) (gdu.Filelike, error) {
 	}
 
 	if fileInfo.IsDir() {
-		ret, err = examineDir(path)
+		dir := gdu.NewDir(path, fileInfo)
+		ret = &dir
 	} else if fileInfo.Mode().IsRegular() {
-		ret, err = examineFile(fileInfo, path)
-	}
-	if err == nil && ret != nil && flags.PrintDetails == true {
-		printEntry(ret)
+		file := gdu.NewFile(path, fileInfo)
+		ret = &file
 	}
 
 	return ret, err
 }
 
-func printEntry(entry gdu.Filelike) {
+func examineFilelike(jobQueue chan gdu.Filelike, wg *sync.WaitGroup, file gdu.Filelike) {
+	switch file.(type) {
+	case *gdu.Dir:
+		examineDir(jobQueue, wg, file.(*gdu.Dir))
+	case *gdu.File:
+		examineFile(file.(*gdu.File))
+	}
+}
+
+func enqueueJob(jobQueue chan gdu.Filelike, wg *sync.WaitGroup, job gdu.Filelike) {
+	wg.Add(1)
+	select {
+	case jobQueue <- job: // ok, someone else took it
+	default:
+		// do it myself, no one else has time:
+		examineFilelike(jobQueue, wg, job)
+		wg.Done()
+	}
+}
+
+func printEntry(entry gdu.Filelike, flags gdu.Flags) {
+	if flags.PrintDetails == gdu.OUTPUT_FULL {
+		switch entry.(type) {
+		case *gdu.Dir:
+			for _, child := range entry.(*gdu.Dir).Children {
+				printEntry(child, flags)
+			}
+		}
+	}
 	if flags.HumanReadable {
 		fmt.Printf("%s\t%s\n", toHumanReadableSize(entry.GetByteSize()), entry.GetPath())
 	} else {
@@ -77,6 +93,9 @@ var logBase float64 = math.Log10(kbyteBase)
 
 func toHumanReadableSize(byteSize uint64) string {
 	var res string
+	if byteSize == 0 {
+		return "0"
+	}
 
 	thousands := math.Floor(math.Log10(float64(byteSize)) / logBase)
 	displaySize := float64(byteSize) / (math.Pow(kbyteBase, thousands))
@@ -101,37 +120,51 @@ func toHumanReadableSize(byteSize uint64) string {
 }
 
 func main() {
+	flags := gdu.Flags{HumanReadable: false, PrintDetails: gdu.OUTPUT_FULL, NrOfWorkers: 1}
+
+	workers := gdu.MaxInt(runtime.NumCPU(), 1)
 	summary := flag.Bool("s", false, "print only summary per given file")
 	humanReadable := flag.Bool("h", false, "Print human readable sizes")
 
 	flag.Parse()
 	searchPaths := flag.Args()
-	flags.PrintDetails = *summary != true
+	if *summary == true {
+		flags.PrintDetails = gdu.OUTPUT_SUMMARY
+	}
 	flags.HumanReadable = *humanReadable
+	flags.NrOfWorkers = workers
 
-	total := uint64(0)
-	ch := make(chan uint64, len(searchPaths))
+	topLevelFiles := make([]gdu.Filelike, 0)
+	jobs := make(chan gdu.Filelike)
+	wg := new(sync.WaitGroup)
+
+	for i := 0; i < flags.NrOfWorkers; i++ {
+		go func() {
+			for job := range jobs {
+				// do job
+				examineFilelike(jobs, wg, job)
+				wg.Done()
+			}
+		}()
+	}
 
 	for _, path := range searchPaths {
-		// process each given path in a separate go routine in parallel:
-		go func(p string, res chan<- uint64) {
-			var size uint64 = 0
-			ret, err := examinePath(p)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-			} else if ret != nil {
-				// print dir summary only if printDetails is false, otherwise it will already be printed above
-				if flags.PrintDetails == false {
-					printEntry(ret)
-				}
-				size = ret.GetByteSize()
-			}
-			res <- size
-		}(path, ch)
+		filelike, err := createFileLike(path)
+		if err == nil {
+			topLevelFiles = append(topLevelFiles, filelike)
+			enqueueJob(jobs, wg, filelike)
+		}
 	}
-	for i := 0; i < len(searchPaths); i++ {
-		total += <-ch
-	}
+	wg.Wait()
+	close(jobs)
 
-	printEntry(gdu.File{RelPath: "Total", SizeBytes: total})
+	var total uint64 = 0
+	for _, f := range topLevelFiles {
+		total += f.GetByteSize()
+		printEntry(f, flags)
+		// fmt.Printf("%v %v, nr of childs: \n", toHumanReadableSize(f.GetByteSize()), f.GetPath())
+	}
+	if len(topLevelFiles) > 1 {
+		printEntry(&gdu.File{SizeBytes: total, RelPath: "Total"}, flags)
+	}
 }
