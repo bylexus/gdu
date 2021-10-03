@@ -8,55 +8,20 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+
+	gdu "alexi.ch/gdu/lib"
 )
 
-type Flags struct {
-	humanReadable bool
-	printDetails  bool
-}
+var flags gdu.Flags = gdu.Flags{HumanReadable: false, PrintDetails: true}
 
-var flags Flags = Flags{false, true}
-
-type filelike interface {
-	getPath() string
-	getByteSize() uint64
-}
-
-type file struct {
-	relPath   string
-	sizeBytes uint64
-}
-
-func (f file) getPath() string {
-	return f.relPath
-}
-
-func (f file) getByteSize() uint64 {
-	return f.sizeBytes
-}
-
-type dir struct {
-	relPath        string
-	totalSizeBytes uint64
-	children       []filelike
-}
-
-func (d dir) getPath() string {
-	return d.relPath
-}
-
-func (d dir) getByteSize() uint64 {
-	return d.totalSizeBytes
-}
-
-func examineDir(path string) (filelike, error) {
+func examineDir(path string) (gdu.Filelike, error) {
 	var files []fs.FileInfo
 	var err error
 
-	d := dir{
-		relPath:        path,
-		totalSizeBytes: 0,
-		children:       make([]filelike, 0),
+	d := gdu.Dir{
+		RelPath:        path,
+		TotalSizeBytes: 0,
+		Children:       make([]gdu.Filelike, 0),
 	}
 	files, err = ioutil.ReadDir(path)
 	if err != nil {
@@ -65,22 +30,22 @@ func examineDir(path string) (filelike, error) {
 	for _, file := range files {
 		child, err := examinePath(filepath.Join(path, file.Name()))
 		if err == nil && child != nil {
-			d.totalSizeBytes += child.getByteSize()
-			d.children = append(d.children, child)
+			d.TotalSizeBytes += child.GetByteSize()
+			d.Children = append(d.Children, child)
 		}
 	}
 	return d, nil
 }
 
-func examineFile(fileInfo fs.FileInfo, path string) (filelike, error) {
-	return file{
-		relPath:   path,
-		sizeBytes: uint64(fileInfo.Size()),
+func examineFile(fileInfo fs.FileInfo, path string) (gdu.Filelike, error) {
+	return gdu.File{
+		RelPath:   path,
+		SizeBytes: uint64(fileInfo.Size()),
 	}, nil
 }
 
-func examinePath(path string) (filelike, error) {
-	var ret filelike
+func examinePath(path string) (gdu.Filelike, error) {
+	var ret gdu.Filelike
 
 	fileInfo, err := os.Stat(path)
 	if err != nil {
@@ -92,18 +57,18 @@ func examinePath(path string) (filelike, error) {
 	} else if fileInfo.Mode().IsRegular() {
 		ret, err = examineFile(fileInfo, path)
 	}
-	if err == nil && ret != nil && flags.printDetails == true {
+	if err == nil && ret != nil && flags.PrintDetails == true {
 		printEntry(ret)
 	}
 
 	return ret, err
 }
 
-func printEntry(entry filelike) {
-	if flags.humanReadable {
-		fmt.Printf("%s\t%s\n", toHumanReadableSize(entry.getByteSize()), entry.getPath())
+func printEntry(entry gdu.Filelike) {
+	if flags.HumanReadable {
+		fmt.Printf("%s\t%s\n", toHumanReadableSize(entry.GetByteSize()), entry.GetPath())
 	} else {
-		fmt.Printf("%d\t%s\n", entry.getByteSize(), entry.getPath())
+		fmt.Printf("%d\t%s\n", entry.GetByteSize(), entry.GetPath())
 	}
 }
 
@@ -141,8 +106,8 @@ func main() {
 
 	flag.Parse()
 	searchPaths := flag.Args()
-	flags.printDetails = *summary != true
-	flags.humanReadable = *humanReadable
+	flags.PrintDetails = *summary != true
+	flags.HumanReadable = *humanReadable
 
 	total := uint64(0)
 	ch := make(chan uint64, len(searchPaths))
@@ -156,10 +121,10 @@ func main() {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 			} else if ret != nil {
 				// print dir summary only if printDetails is false, otherwise it will already be printed above
-				if flags.printDetails == false {
+				if flags.PrintDetails == false {
 					printEntry(ret)
 				}
-				size = ret.getByteSize()
+				size = ret.GetByteSize()
 			}
 			res <- size
 		}(path, ch)
@@ -168,5 +133,5 @@ func main() {
 		total += <-ch
 	}
 
-	printEntry(file{"Total", total})
+	printEntry(gdu.File{RelPath: "Total", SizeBytes: total})
 }
